@@ -1,0 +1,532 @@
+// ==UserScript==
+// @name         Amazon Sorters LC Dashboard (Hours / Volume / UPH + LC 1–5)
+// @namespace    https://tampermonkey.net/
+// @version      1.0.0
+// @description  Adds a floating dashboard that parses a Sorter table, computes Hours/Volume/UPH, and assigns Learning Curve (LC) levels 1–5 with export + live settings.
+// @author       You
+// @match        https://*.amazon.com/*
+// @match        https://*.a2z.com/*
+// @match        https://*.amazon.work/*
+// @match        https://*.internal/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /*************** CONFIG (you can edit in the in-page Settings too) ***************/
+  const DEFAULT_CONFIG = {
+    // Choose which rule assigns LC: "uph" or "hours"
+    lcRule: "uph",
+
+    // LC thresholds by UPH (inclusive upper bound on each band, last one is Infinity)
+    lcByUPH: [
+      { max: 100, lc: 1 },
+      { max: 200, lc: 2 },
+      { max: 300, lc: 3 },
+      { max: 400, lc: 4 },
+      { max: Infinity, lc: 5 },
+    ],
+
+    // LC thresholds by HOURS (inclusive upper bound)
+    lcByHours: [
+      { max: 8, lc: 1 },
+      { max: 24, lc: 2 },
+      { max: 56, lc: 3 },
+      { max: 120, lc: 4 },
+      { max: Infinity, lc: 5 },
+    ],
+
+    // Column header text as it appears in your table (case-insensitive contains match)
+    columns: {
+      name: "Associate",
+      hours: "Hours",
+      volume: "Volume", // a.k.a. Units
+      uph: "UPH",       // if missing, it will be computed as volume/hours
+    },
+
+    // Where to find the data table on your page
+    selectors: {
+      table: "table",        // main selector for the table to parse
+      rows: "tbody tr",      // data rows
+      headers: "thead th",   // header cells
+      cells: "td",           // body cells
+    },
+
+    // Formatting
+    decimalsUPH: 2,
+    decimalsHours: 2,
+
+    // Re-scan when the page changes (SPAs, filters)
+    observeMutations: true,
+  };
+
+  /*************** STATE ***************/
+  const STORE_KEY = "__amazon_sorters_lc_dashboard_config_v1";
+  let CONFIG = loadConfig();
+  let lastParsed = [];
+
+  function loadConfig() {
+    try {
+      const raw = localStorage.getItem(STORE_KEY);
+      if (!raw) return structuredClone(DEFAULT_CONFIG);
+      const parsed = JSON.parse(raw);
+      return { ...structuredClone(DEFAULT_CONFIG), ...parsed };
+    } catch {
+      return structuredClone(DEFAULT_CONFIG);
+    }
+  }
+
+  function saveConfig() {
+    localStorage.setItem(STORE_KEY, JSON.stringify(CONFIG));
+  }
+
+  /*************** UTIL ***************/
+  const toNum = (val) => {
+    if (val == null) return NaN;
+    if (typeof val === "number") return val;
+    // Strip commas and non-numeric (keep dot and minus)
+    const clean = String(val).replace(/[^0-9.\-]/g, "");
+    const num = parseFloat(clean);
+    return isFinite(num) ? num : NaN;
+  };
+
+  function round(num, places = 2) {
+    if (!isFinite(num)) return num;
+    const p = Math.pow(10, places);
+    return Math.round(num * p) / p;
+  }
+
+  function findHeaderIndexes(table, headersSelector, desiredColumns) {
+    const map = {}; // header text(lower) -> index
+    const ths = table.querySelectorAll(headersSelector);
+    ths.forEach((th, i) => {
+      const text = th.textContent.trim().toLowerCase();
+      map[text] = i;
+    });
+
+    // Fuzzy contains matching
+    const idxs = {};
+    const keys = Object.keys(desiredColumns);
+    keys.forEach((k) => {
+      const needle = desiredColumns[k].trim().toLowerCase();
+      let bestIdx = -1;
+      // exact match first
+      if (map.hasOwnProperty(needle)) {
+        idxs[k] = Object.keys(map).indexOf(needle) >= 0 ? map[needle] : -1;
+        return;
+      }
+      // try contains scan
+      let bestKey = null;
+      Object.keys(map).forEach((hdr) => {
+        if (hdr.includes(needle)) {
+          bestKey = hdr;
+        }
+      });
+      if (bestKey != null) bestIdx = map[bestKey];
+      idxs[k] = bestIdx;
+    });
+    return idxs;
+  }
+
+  function assignLC(value, bands) {
+    for (const b of bands) {
+      if (value <= b.max) return b.lc;
+    }
+    return 5;
+  }
+
+  function computeLC(row) {
+    if (CONFIG.lcRule === "hours") {
+      const hours = row.hours ?? NaN;
+      return assignLC(hours, CONFIG.lcByHours);
+    } else {
+      const uph = row.uph ?? NaN;
+      return assignLC(uph, CONFIG.lcByUPH);
+    }
+  }
+
+  function parseTable() {
+    const table = document.querySelector(CONFIG.selectors.table);
+    if (!table) return [];
+
+    const idx = findHeaderIndexes(table, CONFIG.selectors.headers, CONFIG.columns);
+    const missing = Object.entries(idx).filter(([, v]) => v < 0).map(([k]) => k);
+
+    // We only require name + (hours and volume OR uph). Try to work with what we have.
+    if (idx.name < 0) return [];
+
+    const rows = table.querySelectorAll(CONFIG.selectors.rows);
+    const out = [];
+
+    rows.forEach((tr) => {
+      const tds = tr.querySelectorAll(CONFIG.selectors.cells);
+      if (!tds || !tds.length) return;
+
+      const name = idx.name >= 0 ? tds[idx.name]?.textContent.trim() : "";
+      const rawHours = idx.hours >= 0 ? tds[idx.hours]?.textContent.trim() : "";
+      const rawVol = idx.volume >= 0 ? tds[idx.volume]?.textContent.trim() : "";
+      const rawUPH = idx.uph >= 0 ? tds[idx.uph]?.textContent.trim() : "";
+
+      const hours = toNum(rawHours);
+      const volume = toNum(rawVol);
+      let uph = toNum(rawUPH);
+
+      if ((!isFinite(uph) || isNaN(uph)) && isFinite(hours) && hours > 0 && isFinite(volume)) {
+        uph = volume / hours;
+      }
+
+      if (!name) return;
+
+      const rec = {
+        name,
+        hours: isFinite(hours) ? round(hours, CONFIG.decimalsHours) : NaN,
+        volume: isFinite(volume) ? volume : NaN,
+        uph: isFinite(uph) ? round(uph, CONFIG.decimalsUPH) : NaN,
+      };
+      rec.lc = computeLC(rec);
+      out.push(rec);
+    });
+
+    return out;
+  }
+
+  /*************** UI ***************/
+  const styles = `
+#lcDash_btn {
+  position: fixed; right: 16px; bottom: 16px; z-index: 999999;
+  padding: 10px 12px; border-radius: 10px; background: #111827; color: #fff; cursor: pointer; font-size: 14px;
+  box-shadow: 0 6px 18px rgba(0,0,0,.25);
+}
+#lcDash_panel {
+  position: fixed; right: 16px; bottom: 66px; z-index: 999999; width: 560px; max-height: 60vh; overflow: auto;
+  border-radius: 12px; background: #ffffff; color: #111827; border: 1px solid #e5e7eb;
+  box-shadow: 0 12px 30px rgba(0,0,0,.25); display: none;
+}
+#lcDash_panel header {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 10px 12px; border-bottom: 1px solid #e5e7eb; position: sticky; top: 0; background: #fff;
+}
+#lcDash_panel header .title { font-weight: 700; }
+#lcDash_panel header .btns button {
+  margin-left: 6px; padding: 6px 8px; border-radius: 8px; border: 1px solid #e5e7eb; background: #f9fafb; cursor: pointer;
+}
+#lcDash_table {
+  width: 100%; border-collapse: collapse; font-size: 13px;
+}
+#lcDash_table th, #lcDash_table td {
+  padding: 8px 10px; border-bottom: 1px solid #f1f5f9; text-align: left;
+}
+#lcDash_table th { position: sticky; top: 44px; background: #fff; z-index: 1; }
+.lc-pill {
+  display: inline-block; min-width: 28px; text-align: center; padding: 2px 8px; border-radius: 999px; font-weight: 700; color: #fff;
+}
+.lc1 { background: #7c3aed; }  /* purple */
+.lc2 { background: #2563eb; }  /* blue */
+.lc3 { background: #059669; }  /* green */
+.lc4 { background: #d97706; }  /* amber */
+.lc5 { background: #dc2626; }  /* red */
+#lcDash_empty {
+  padding: 16px; color: #6b7280; font-style: italic;
+}
+#lcDash_settings {
+  padding: 12px; border-top: 1px solid #e5e7eb; display: none; background: #fcfcfc;
+}
+#lcDash_settings label { font-size: 12px; color: #374151; margin-top: 8px; display: block; }
+#lcDash_settings input, #lcDash_settings select, #lcDash_settings textarea {
+  width: 100%; margin-top: 4px; padding: 6px 8px; border: 1px solid #e5e7eb; border-radius: 8px; font-size: 12px; background: #fff;
+}
+#lcDash_foot {
+  padding: 10px 12px; display: flex; justify-content: space-between; align-items: center; border-top: 1px solid #e5e7eb; background: #fff;
+  position: sticky; bottom: 0;
+}
+.small { font-size: 12px; color: #6b7280; }
+`;
+
+  function injectUI() {
+    if (document.getElementById("lcDash_btn")) return;
+    const st = document.createElement("style");
+    st.textContent = styles;
+    document.head.appendChild(st);
+
+    const btn = document.createElement("button");
+    btn.id = "lcDash_btn";
+    btn.textContent = "LC Panel";
+    btn.title = "Amazon Sorters LC Dashboard";
+    btn.addEventListener("click", () => {
+      const panel = document.getElementById("lcDash_panel");
+      if (!panel) return;
+      panel.style.display = panel.style.display === "none" ? "block" : "none";
+      if (panel.style.display === "block") refreshPanel();
+    });
+    document.body.appendChild(btn);
+
+    const panel = document.createElement("div");
+    panel.id = "lcDash_panel";
+    panel.innerHTML = `
+      <header>
+        <div class="title">Sorter Learning Curve (LC) Dashboard</div>
+        <div class="btns">
+          <button id="lcDash_rescan">Rescan</button>
+          <button id="lcDash_export">Export CSV</button>
+          <button id="lcDash_toggleSettings">⚙︎</button>
+          <button id="lcDash_close">✕</button>
+        </div>
+      </header>
+      <div id="lcDash_body">
+         <div id="lcDash_empty">No data parsed yet. Click “Rescan” or adjust Settings (⚙︎).</div>
+         <table id="lcDash_table" style="display:none;">
+           <thead>
+             <tr>
+               <th>Associate</th>
+               <th>Hours</th>
+               <th>Volume</th>
+               <th>UPH</th>
+               <th>LC</th>
+             </tr>
+           </thead>
+           <tbody></tbody>
+         </table>
+      </div>
+      <div id="lcDash_settings">
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px;">
+          <div>
+            <label>LC Rule</label>
+            <select id="lc_rule">
+              <option value="uph">UPH</option>
+              <option value="hours">Hours</option>
+            </select>
+          </div>
+          <div>
+            <label>UPH Decimals</label>
+            <input id="lc_uph_dec" type="number" min="0" max="4" />
+          </div>
+          <div>
+            <label>Hours Decimals</label>
+            <input id="lc_hours_dec" type="number" min="0" max="4" />
+          </div>
+          <div>
+            <label>Observe Page Mutations</label>
+            <select id="lc_observe">
+              <option value="true">true</option>
+              <option value="false">false</option>
+            </select>
+          </div>
+        </div>
+
+        <label>Column Names (fuzzy match; case-insensitive)</label>
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px;">
+          <div><input id="col_name" placeholder="Associate" /></div>
+          <div><input id="col_hours" placeholder="Hours" /></div>
+          <div><input id="col_volume" placeholder="Volume" /></div>
+          <div><input id="col_uph" placeholder="UPH" /></div>
+        </div>
+
+        <label>Selectors (advanced)</label>
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px;">
+          <div><input id="sel_table" placeholder="table" /></div>
+          <div><input id="sel_rows" placeholder="tbody tr" /></div>
+          <div><input id="sel_headers" placeholder="thead th" /></div>
+          <div><input id="sel_cells" placeholder="td" /></div>
+        </div>
+
+        <label>LC by UPH (JSON array)</label>
+        <textarea id="json_uph" rows="3"></textarea>
+
+        <label>LC by HOURS (JSON array)</label>
+        <textarea id="json_hours" rows="3"></textarea>
+
+        <div style="margin-top:8px; display:flex; gap:8px;">
+          <button id="lc_save">Save</button>
+          <button id="lc_reset">Reset to Defaults</button>
+        </div>
+      </div>
+      <div id="lcDash_foot">
+        <div class="small">Tip: If UPH isn’t in the table, it’ll be computed as Volume ÷ Hours.</div>
+        <div class="small">LC bands configurable in ⚙︎.</div>
+      </div>
+    `;
+    document.body.appendChild(panel);
+
+    // Wire controls
+    panel.querySelector("#lcDash_close").addEventListener("click", () => {
+      panel.style.display = "none";
+    });
+    panel.querySelector("#lcDash_rescan").addEventListener("click", () => {
+      refreshPanel();
+    });
+    panel.querySelector("#lcDash_export").addEventListener("click", () => {
+      exportCSV(lastParsed);
+    });
+    panel.querySelector("#lcDash_toggleSettings").addEventListener("click", () => {
+      const s = panel.querySelector("#lcDash_settings");
+      s.style.display = s.style.display === "none" ? "block" : "none";
+      if (s.style.display === "block") loadSettingsUI();
+    });
+
+    panel.querySelector("#lc_save").addEventListener("click", () => {
+      saveSettingsUI();
+      refreshPanel();
+    });
+    panel.querySelector("#lc_reset").addEventListener("click", () => {
+      CONFIG = structuredClone(DEFAULT_CONFIG);
+      saveConfig();
+      loadSettingsUI();
+      refreshPanel();
+    });
+  }
+
+  function loadSettingsUI() {
+    const qs = (id) => document.querySelector("#" + id);
+    qs("lc_rule").value = CONFIG.lcRule;
+    qs("lc_uph_dec").value = CONFIG.decimalsUPH;
+    qs("lc_hours_dec").value = CONFIG.decimalsHours;
+    qs("lc_observe").value = String(CONFIG.observeMutations);
+
+    qs("col_name").value = CONFIG.columns.name;
+    qs("col_hours").value = CONFIG.columns.hours;
+    qs("col_volume").value = CONFIG.columns.volume;
+    qs("col_uph").value = CONFIG.columns.uph;
+
+    qs("sel_table").value = CONFIG.selectors.table;
+    qs("sel_rows").value = CONFIG.selectors.rows;
+    qs("sel_headers").value = CONFIG.selectors.headers;
+    qs("sel_cells").value = CONFIG.selectors.cells;
+
+    qs("json_uph").value = JSON.stringify(CONFIG.lcByUPH, null, 2);
+    qs("json_hours").value = JSON.stringify(CONFIG.lcByHours, null, 2);
+  }
+
+  function saveSettingsUI() {
+    const qs = (id) => document.querySelector("#" + id);
+    CONFIG.lcRule = qs("lc_rule").value;
+    CONFIG.decimalsUPH = Math.max(0, Math.min(4, parseInt(qs("lc_uph_dec").value || "2", 10)));
+    CONFIG.decimalsHours = Math.max(0, Math.min(4, parseInt(qs("lc_hours_dec").value || "2", 10)));
+    CONFIG.observeMutations = qs("lc_observe").value === "true";
+
+    CONFIG.columns.name = qs("col_name").value || DEFAULT_CONFIG.columns.name;
+    CONFIG.columns.hours = qs("col_hours").value || DEFAULT_CONFIG.columns.hours;
+    CONFIG.columns.volume = qs("col_volume").value || DEFAULT_CONFIG.columns.volume;
+    CONFIG.columns.uph = qs("col_uph").value || DEFAULT_CONFIG.columns.uph;
+
+    CONFIG.selectors.table = qs("sel_table").value || DEFAULT_CONFIG.selectors.table;
+    CONFIG.selectors.rows = qs("sel_rows").value || DEFAULT_CONFIG.selectors.rows;
+    CONFIG.selectors.headers = qs("sel_headers").value || DEFAULT_CONFIG.selectors.headers;
+    CONFIG.selectors.cells = qs("sel_cells").value || DEFAULT_CONFIG.selectors.cells;
+
+    try {
+      const uph = JSON.parse(qs("json_uph").value);
+      if (Array.isArray(uph) && uph.length) CONFIG.lcByUPH = uph;
+    } catch {}
+    try {
+      const hrs = JSON.parse(qs("json_hours").value);
+      if (Array.isArray(hrs) && hrs.length) CONFIG.lcByHours = hrs;
+    } catch {}
+
+    saveConfig();
+  }
+
+  function refreshPanel() {
+    const data = parseTable();
+    lastParsed = data;
+
+    const empty = document.getElementById("lcDash_empty");
+    const table = document.getElementById("lcDash_table");
+    const tbody = table.querySelector("tbody");
+    tbody.innerHTML = "";
+
+    if (!data.length) {
+      table.style.display = "none";
+      empty.style.display = "block";
+      return;
+    }
+
+    // Sort by name asc
+    data.sort((a, b) => a.name.localeCompare(b.name));
+
+    for (const r of data) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${esc(r.name)}</td>
+        <td>${isFinite(r.hours) ? r.hours.toFixed(CONFIG.decimalsHours) : ""}</td>
+        <td>${isFinite(r.volume) ? r.volume : ""}</td>
+        <td>${isFinite(r.uph) ? r.uph.toFixed(CONFIG.decimalsUPH) : ""}</td>
+        <td>${renderLCPill(r.lc)}</td>
+      `;
+      tbody.appendChild(tr);
+    }
+
+    empty.style.display = "none";
+    table.style.display = "table";
+  }
+
+  function renderLCPill(lc) {
+    const cl = `lc-pill lc${lc}`;
+    return `<span class="${cl}">${lc}</span>`;
+  }
+
+  function esc(s) {
+    return String(s)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;");
+  }
+
+  function exportCSV(rows) {
+    if (!rows || !rows.length) return;
+    const headers = ["Associate", "Hours", "Volume", "UPH", "LC"];
+    const lines = [headers.join(",")];
+
+    rows.forEach((r) => {
+      const row = [
+        `"${String(r.name).replaceAll('"', '""')}"`,
+        isFinite(r.hours) ? r.hours : "",
+        isFinite(r.volume) ? r.volume : "",
+        isFinite(r.uph) ? r.uph : "",
+        r.lc ?? "",
+      ];
+      lines.push(row.join(","));
+    });
+
+    const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const now = new Date();
+    const ts = now.toISOString().replace(/[:.]/g, "-");
+    a.href = url;
+    a.download = `sorters_lc_${ts}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  /*************** MUTATION OBSERVER (optional) ***************/
+  let observer = null;
+  function startObserver() {
+    if (observer) {
+      observer.disconnect();
+      observer = null;
+    }
+    if (!CONFIG.observeMutations) return;
+    observer = new MutationObserver(() => {
+      // If panel is open, refresh when DOM changes
+      const panel = document.getElementById("lcDash_panel");
+      if (panel && panel.style.display === "block") {
+        // Debounce a little
+        clearTimeout(startObserver._t);
+        startObserver._t = setTimeout(refreshPanel, 300);
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+  /*************** INIT ***************/
+  function init() {
+    injectUI();
+    startObserver();
+  }
+
+  // run
+  init();
+})();
